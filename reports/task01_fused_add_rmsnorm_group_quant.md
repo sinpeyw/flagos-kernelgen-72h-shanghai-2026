@@ -1,69 +1,238 @@
 # Task 01：Fused Add + RMSNorm + Group Quant
 
-## 最终官方成绩
+> FlagOS KernelGen 72H 上海站 · 最终榜单截至 2026-07-20 12:00（UTC+8） · 对应实现见 [`src/task01_fused_add_rmsnorm_group_quant.py`](../src/task01_fused_add_rmsnorm_group_quant.py)
 
-**4.38x，rank 1**。六平台分项为：海光 4.39x、沐曦 2.90x、昇腾 5.98x、NVIDIA 3.99x、平头哥 4.71x、天数智芯 4.92x。
+## 最终效果
 
-## 算子与瓶颈
+**最终官方成绩：4.38x，rank 1，六个平台全部通过。**
 
-每行依次执行：
+| 海光 | 沐曦 | 昇腾 | NVIDIA | 平头哥 | 天数智芯 | 几何平均 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4.39x | 2.90x | 5.98x | 3.99x | 4.71x | 4.92x | **4.38x** |
 
-1. `r = x + residual`，并写出 `residual_out`；
-2. `inv_rms = rsqrt(mean(r²) + eps)`；
-3. `y = r * inv_rms * gamma`，并写出 `norm_out`；
-4. 每 `group_size` 个元素求绝对值最大值，生成 scale 与 int8 量化结果。
+### 技术摘要
 
-在 bf16 输入/输出、int8 量化下，忽略缓存复用和对齐填充，单行不可避免的数据量约为：
+- 该算子的主体算术强度只有约 **0.666 FLOP/Byte**，大 workload 首先受 HBM、寄存器 live range 和规约依赖限制，而不是 Tensor/Cube 算力限制。
+- 总体方案是维持**单 kernel、单遍输入、四输出直接写回**，再按小/大 `M`、warp/wave 宽度和昇腾双 AIV 能力选择不同的行所有权。
+- 最关键的结构收益来自：preweighted 单遍融合、分段流式状态、昇腾双 AIV 独立行映射，以及 warp/wave 原生规约与跨行 `gamma` 复用。
+
+---
+
+## 1. 题目拆解：一次行规约连接四个输出
+
+设输入为 `x,residual ∈ BF16[M,D]`，每 `G` 个元素构成一个量化组：
 
 ```text
-读取 x + residual                 4D bytes
-写 residual_out + norm_out       4D bytes
-写 x_q                           1D bytes
-读 gamma                         2D bytes（跨行可缓存）
-写 scale                         4D/G bytes
+r       = x + residual
+inv_rms = rsqrt(mean(r²) + eps)
+y       = r * inv_rms * gamma
+scale_g = max(abs(y_g)) / 127
+q_g     = clamp(round(y_g / scale_g), -127, 127)
 ```
 
-主体算术只是逐元素加乘、平方、绝对值与规约，算术强度很低；大形状主要受显存流量、规约代价和 kernel 启动开销约束。优化重点不是增加计算峰值利用率，而是避免中间张量和重复读取。
+必须同时写出：
 
-## 实际有效的优化
+- `residual_out = r`；
+- `norm_out = y`；
+- `x_q = q`；
+- `x_scale = scale`。
 
-### 1. 单次读取并保留 preweighted 数据
+困难在于 RMS 需要整行规约，而量化又需要每组规约。如果先写中间张量再启动第二个 kernel，整行数据会被重复搬运；如果把整行全部常驻，`D=4096–8192` 又会产生过宽的寄存器状态。
 
-融合内核在读取 `x` 与 `residual` 后立即得到 `r`，一边累加平方和、一边写 `residual_out`，同时计算 `r * gamma` 并保留在寄存器/局部值中。得到最终 `inv_rms` 后，直接完成 `norm_out`、group max、scale 与 int8 写回。
+**图 1　单次输入读取同时服务行规约、分组规约和四路输出**
 
-这避免了拆分实现中对 `r` 或 `norm_out` 的额外全局内存往返。收益最稳定，也构成所有后端路径的共同基础。
+```mermaid
+flowchart LR
+    A["x + residual"] --> B["行平方和"]
+    A --> C["residual_out"]
+    A --> D["乘 gamma，保留 weighted"]
+    B --> E["inv_rms"]
+    D --> F["group absmax"]
+    E --> G["norm_out"]
+    F --> H["scale"]
+    E --> I["INT8 quant"]
+    H --> I
+```
 
-### 2. 按行形状选择 full-row 与 segmented-row
+---
 
-- 小 `M` 使用 full-row，避免多 kernel、partial buffer 和额外归约；
-- 大 `D` 使用 2048/4096 宽 segment，降低单 program 的寄存器压力；
-- 海光、沐曦、NVIDIA、平头哥根据后端调整 `num_warps`、segment 宽度和 direct-int8 路径；
-- NVIDIA 在 `M >= 512, D <= 6144` 时用两行一组，复用同一段 `gamma`，并保持行间写入完全不重叠。
+## 2. 总体方案：数学融合不变，物理执行按芯片分流
 
-这里的关键不是固定某个 tile，而是让“行并行度、寄存器容量、gamma 复用”同时处于可接受区间。
+统一的数据流是“一次读入、片上规约、直接写回”；后端分支只改变行所有权、segment 宽度、warp 数和规约树。
 
-### 3. 昇腾双 AIV 行映射
+| workload / 后端 | 主要执行结构 | 设计目标 |
+|---|---|---|
+| 小 `M` | one-program-per-row full-row | 避免多阶段启动与 partial buffer |
+| 大 `M,D` | 2048/4096 宽 segmented streaming | 限制寄存器状态，同时维持单遍输入 |
+| NVIDIA A100 | 两行一组、W8、分段流式 | 跨行复用 `gamma`，提高 resident rows |
+| 海光 / 沐曦 | W4、分段流式 | 匹配独立 STREAM 测得的最优 wave 配置 |
+| 平头哥 | W8、direct-int8 | 利用 warp32 与高带宽，减少转换路径 |
+| 天数 BI-V150 | wave64 分层 group max | 用原生 64-lane 规约控制宽 group 状态 |
+| 昇腾 910B4 | 两个 AIV 各拥有一行 | 避免同一行的跨子核 partial 与同步 |
 
-对 `M >= 8` 的昇腾形状，入口使用：
+---
+
+## 3. 瓶颈分析：大形状是带宽问题，小形状是延迟问题
+
+令 `N=M·D`，忽略 `abs/max/round/clamp` 等非 FLOP 指令，常规浮点工作量约为：
+
+```text
+F ≈ 6N + 3M + 2N/G
+```
+
+API 无法消除的最低主存流量为：
+
+```text
+B_min = 9N + 4N/G + s_gamma·D
+```
+
+其中 `9N` 来自两路 BF16 输入、两路 BF16 输出和一路 INT8 输出。若 `gamma` 被 cache，`G=128` 时：
+
+```text
+AI ≈ 6.016 / 9.031 = 0.666 FLOP/Byte
+```
+
+A100 的 FP32 ridge point 为 `19.5 TFLOPS / 1555 GB/s = 12.54 FLOP/Byte`，比该算子高约 **18.8 倍**。因此大 workload 不可能首先受 FP32 峰值限制；增加第二遍读取或全局 scratch 必然抬高带宽下界。
+
+| 规模 | 主导因素 | 直接含义 |
+|---|---|---|
+| `M≤32` | kernel launch、行规约依赖、低 occupancy | 优先单 kernel 和较小状态 |
+| `M≈128` | 延迟向带宽过渡 | full-row 与 segmented 需要独立路由 |
+| `M≥512` | HBM、cache、合并访存 | 坚持单遍输入，避免 scratch |
+
+独立 STREAM 诊断也给出了后端选择依据：海光/沐曦在 W4 下分别达到 1331/1498 GB/s；A100、平头哥在 W8 下达到 1374/2170 GB/s。统一 `num_warps` 会直接损失有效带宽。
+
+---
+
+## 4. 为什么必须做芯片专用分支
+
+| 架构差异 | 对本题的影响 | 对应分支 |
+|---|---|---|
+| warp32 vs wave64 | group size 128/256 的规约树不同 | warp32 分段；wave64 先做 2/4 个原生最大值 |
+| CU/SM 数量不同 | resident rows 与 program 粒度不同 | 16-CU 天数避免巨型 tile；108-SM A100提高行并行 |
+| 昇腾 Vector/Cube 分离 | RMS/quant 是向量规约，不适合搬到 Cube | 使用 AIV 行所有权，不做 Cube RMS |
+| UB/寄存器容量不同 | D8192 全行状态可能 spill 或 lowering 失败 | 2048/4096 segment、短 live range |
+| 编译器转换路径不同 | INT8 cast、mask、cache hint 的成本不同 | direct-int8 与 backend-specific store |
+
+关键原则是：**共享数学公式，不共享物理 tile。** 同一组 `D/G` 在不同后端上可能对应完全不同的最优规约树和并发度。
+
+---
+
+## 5. 核心技术一：单遍 preweighted 融合逼近 I/O 下界
+
+加载 `x` 与 `residual` 后立即同时执行三件事：
+
+```text
+r        = fp32(x) + fp32(residual)
+sumsq   += r * r
+weighted = r * fp32(gamma)
+```
+
+`r` 直接写入 `residual_out`；`weighted` 与局部 group max 留在片上。整行 `sumsq` 得到 `inv_rms` 后，再把已保留的 `weighted` 转成 `norm_out`、`scale` 和 `x_q`。
+
+与“Add → RMSNorm → Quant”三个 kernel 相比，它删除了：
+
+- `r` 的一次完整写后重读；
+- `norm_out` 的一次完整写后重读；
+- 两次额外 kernel launch；
+- 中间张量的 cache 污染。
+
+收益的上界不来自少做几次乘法，而来自把流量压到接近 `B_min`。因此这个融合是所有后端共同的第一原则。
+
+---
+
+## 6. 核心技术二：分段流式状态，而不是分阶段重读
+
+大 `D` 下不能同时常驻完整行的所有 FP32 状态。实现把列切为 2048/4096 宽 segment，但仍在同一 program 中完成：
+
+1. 每段读取 `x/residual/gamma`；
+2. 累加全行 `sumsq`；
+3. 保存该段 `weighted` 和 group max；
+4. 得到全行 `inv_rms` 后依次写回各段。
+
+这与“两 kernel 分段”有本质区别：
+
+| 方案 | 输入读取 | 全局中间量 | 风险 |
+|---|---:|---:|---|
+| 两阶段 RMS + quant | 至少两遍 | 有 | 带宽翻倍、launch 增加 |
+| 全行常驻 | 一遍 | 无 | D8192 live state 过宽 |
+| **单 program 分段流式** | **一遍** | **无** | 通过 segment 控制状态 |
+
+segment 不是越大越好：过小会增加 helper 和 slice 循环，过大则降低 occupancy。最终按后端和形状选择 2048/4096，而不是使用单一全局常量。
+
+---
+
+## 7. 核心技术三：昇腾双 AIV 的独立行所有权
+
+昇腾 910B4 可通过 `sub_vec_id()` 暴露两个 Vector 子核。最有效的映射不是两个 AIV 协作一行，而是：
 
 ```text
 row = 2 * program_id + sub_vec_id
 ```
 
-两个 vector 子核各自拥有一整行，`unit_flag=True`，不存在跨子核写冲突。相比让两个子核协作同一行，这种映射省去了行内同步和 partial 归约；相比只启用一个子核，则恢复了向量侧并行度。该路径仍保持完整 RMSNorm 与逐组量化数学。
+每个 AIV 独立完成一整行的 add、RMS、group max 和量化，并写入互不重叠的地址。这样：
 
-### 4. 天数智芯 wave64 分层 group max
+- 不需要跨 AIV 合并 `sumsq` 或 group max；
+- 不需要原子操作或全局 partial；
+- 两个子核都得到有效工作；
+- `unit_flag=True` 只承担受支持的同步语义。
 
-天数后端对大 `M` 使用 wave64 分层最大值归约。先在 wave 内规约，再形成 group max，避免用超宽扁平向量承载全部 group 状态。`D=4096/7168` 与其他形状分别选择 stage 数，以控制流水和资源占用。
+官方单变量演进中，昇腾分项从单 AIV 结构的 1.51x，依次提升到双 AIV 局部路由的 1.71x、全大形状的 1.87x，再到启用 `unit_flag` 的 2.07x。相反，Cube RMS、输入 DSA 地址空间转换和 multibuffer 均没有形成可复现正收益。
 
-## 没有转化为最终收益的方向
+---
 
-- 单纯改成 block pointer，没有消除主导的 compulsory I/O；
-- 把 RMS 放到 Cube/矩阵路径，搬运与调度成本超过简单向量规约；
-- 多阶段实现重复读取完整行，通常不如融合路径；
-- 更激进的 multibuffer、跨子核协作和实验性 TLE pipeline 没有形成稳定收益；
-- 只调 `num_warps` 或 `num_stages`，无法替代正确的行所有权与 segment 结构。
+## 8. 核心技术四：让规约树匹配 warp/wave，而非抽象 group size
 
-## 可迁移结论
+`G=128/256` 在 warp32、wave64 和 AIV 上不是同一个物理问题。
 
-对于“逐元素 + 行规约 + 分组规约 + 多输出”的算子，应先计算不可避免的字节数，再围绕一次读取、寄存器保留和无冲突所有权设计内核。跨后端移植时，保留数学融合不变，只把行映射、segment 宽度、wave/warp 数和转换路径做后端特化，通常比维护一套统一 tile 更可靠。
+### NVIDIA：两行共享 `gamma`
+
+A100 的大 `M` 分支让一个 program 处理两行。`gamma` 没有行维度，同一 segment 只加载一次并广播到两行；两行的输出区域完全分离。收益来自减少 `gamma` 指令与 cache 压力，同时保持足够的 row-level parallelism。
+
+### 天数智芯：wave64 分层最大值
+
+BI-V150 用 64-lane wave。对 G128/G256：
+
+```text
+G128: 2 × max64 → max2
+G256: 4 × max64 → max4
+```
+
+相比把 128/256 个元素作为一个超宽状态交给通用 reduction，这种结构缩短跨 wave 依赖链，并降低 group max 的 live state。它体现了同一数学规约必须匹配硬件原生执行宽度。
+
+---
+
+## 9. 其他有效优化汇总
+
+| 优化 | 作用 | 使用边界 |
+|---|---|---|
+| 小 `M` full-row | 最少 launch 与控制逻辑 | 并行度足够前优先 |
+| `cache_modifier` 区分输入/输出 | 输入偏 cache、流式输出减少污染 | 后端支持时启用 |
+| direct-int8 store | 避免多余中间转换 | 昇腾、平头哥、天数专线 |
+| `num_stages=1/2` 分形状选择 | 控制流水与寄存器占用 | D4096/7168 与 D8192 分开 |
+| 静态 backend tag | 入口只做一次设备识别 | 避免热路径动态查询 |
+| 无冲突 row ownership | 删除 atomic 和 partial reduce | 所有正式路径的共同约束 |
+
+被证伪的方向包括：单纯 block pointer 改写、Cube RMS、全局 P/partial 式多阶段、过宽 row tile 和盲目 multibuffer。它们没有减少主 I/O，反而增加状态或编译风险。
+
+---
+
+## 10. 最终成绩
+
+```text
+Hygon 4.39x   MetaX 2.90x   Ascend 5.98x
+NVIDIA 3.99x T-Head 4.71x  TianShu 4.92x
+Geomean 4.38x · Rank 1 · 6/6
+```
+
+最终结果验证了完整路线：先用 Roofline 锁定单遍 I/O，再用芯片专用行所有权和规约树兑现带宽，而不是依赖减少少量标量指令。
+
+---
+
+## 11. 参赛复盘
+
+1. **先算字节，再写 kernel。** 低于 1 FLOP/Byte 的算子，任何额外全量读写都比少几次乘法更昂贵。
+2. **小 shape 与大 shape 必须分开建模。** 小 `M` 由启动和规约延迟主导，大 `M` 才适合用 HBM Roofline。
+3. **一次只验证一个后端变量。** W4/W8、segment、row tile、AIV ownership 必须做单变量官方 A/B，否则无法归因。
+4. **编译成功不等于结构正确。** 昇腾输入 DSA 地址空间、UB 对齐和 Cube 路径都曾通过部分前端，却在后续 lowering 或性能上失败。
+5. **对异常高值必须复测。** 同源代码也可能受编译缓存、运行时或测量波动影响；正式结论应由多轮结果和独立诊断共同支持。
