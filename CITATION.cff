@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite this repository."
+title: "FlagOS KernelGen 72H Shanghai 2026 Solutions"
+type: software
+authors:
+  - name: "KernelGen Shanghai Station contributors"
+date-released: "2026-07-20"
+license: MIT
+version: 1.0.0
