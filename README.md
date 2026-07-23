@@ -4,7 +4,7 @@
 
 ## 最终官方榜单成绩
 
-| 题目 | 最终排名 | 最终平均加速比 | 海光 | 沐曦 | 昇腾 | NVIDIA | 平头哥 | 天数智芯 |
+| 题目 | 排名 |平均加速比 | 海光 | 沐曦 | 昇腾 | NVIDIA | 平头哥 | 天数 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 |Fused Add + RMSNorm + Group Quant | **1** | **4.38x** | 4.39x | 2.90x | 5.98x | 3.99x | 4.71x | 4.92x |
 | DSA TopK Page Table Transform | **5** | **4.24x** | 7.05x | 5.62x | 0.28x | 7.02x | 7.53x | 10.05x |
@@ -13,13 +13,13 @@
 
 ## 官方评测硬件
 
-| 平台 | 确认型号 | 设备名 / 架构 | 计算单元 | 显存 | warp / wave | 关键运行时 |
+| 平台 | 型号 | 设备名  | 计算单元 | 显存 | warp / wave | 运行时 |
 |---|---|---|---:|---:|---:|---|
 | 海光 Hygon | BW1000 | `BW` / `gfx936` | 80 CU | 64 GiB | — | PyTorch 2.4.1，HIP 6.1 |
 | 沐曦 MetaX | MetaX C550 | `MetaX C550` | 104 CU | 约 64 GiB | 64 | PyTorch 2.8.0 + MetaX 3.3，CUDA ABI 11.6 |
 | 华为昇腾 | Ascend 910B4 | `Ascend910B4-1` | — | 约 61 GiB | — | PyTorch 2.6.0，PrivateUse1=`npu` |
 | NVIDIA | A100-SXM4-40GB | `NVIDIA A100-SXM4-40GB` / SM 8.0 | 108 SM | 约 40 GiB | 32 | PyTorch 2.9.0，CUDA 12.8 |
-| 平头哥 T-Head | PPU-ZW810E（真武 810E） | `PPU-ZW810E` | 64 CU | 约 96 GiB | 32 | PyTorch 2.9.0，CUDA ABI 12.9 |
+| 平头哥 T-Head | PPU-ZW810E | `PPU-ZW810E` | 64 CU | 约 96 GiB | 32 | PyTorch 2.9.0，CUDA ABI 12.9 |
 | 天数智芯 | Iluvatar BI-V150 | `Iluvatar BI-V150` / CC 7.1 | 16 CU | 32 GiB | 64 | PyTorch 2.7.1，CUDA ABI 10.2 |
 
 
