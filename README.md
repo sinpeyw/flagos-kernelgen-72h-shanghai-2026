@@ -1,4 +1,4 @@
-# FlagOS 72小时算子赏金挑战赛 – 上海站
+# FlagOS Kernel Challenge Shanghai 2026
 
 本仓库开源[**FlagOS 72小时算子赏金挑战赛 – 上海站**](https://kernelgen.flagos.io/challenge?lang=zh)三道赛题的最终实现及优化报告。代码基于 PyTorch、Triton 与 FlagTree/Triton-TLE，针对六类国产及通用加速器后端分别优化。
 
