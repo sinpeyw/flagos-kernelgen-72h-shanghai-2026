@@ -2,6 +2,19 @@
 
 本仓库开源 FlagOS KernelGen 72H 上海站三道赛题的最终实现及优化报告。代码基于 PyTorch、Triton 与 FlagTree/Triton-TLE，针对六类国产及通用加速器后端分别调度。本文所有成绩均采用赛事最终官方榜单成绩。
 
+## 官方评测硬件
+
+下表来自 2026-07-18 在官方 Task 01/02 评测环境中读取的 PyTorch 公开设备属性；两道题返回的设备指纹完全一致。显存容量由 API 返回字节数换算并取整，`—` 表示该属性未返回。
+
+| 平台 | 确认型号 | 设备名 / 架构 | 计算单元 | 显存 | warp / wave | 关键运行时 |
+|---|---|---|---:|---:|---:|---|
+| 海光 Hygon | BW1000 | `BW` / `gfx936` | 80 CU | 64 GiB | — | PyTorch 2.4.1，HIP 6.1 |
+| 沐曦 MetaX | MetaX C550 | `MetaX C550` | 104 CU | 约 64 GiB | 64 | PyTorch 2.8.0 + MetaX 3.3，CUDA ABI 11.6 |
+| 华为昇腾 | Ascend 910B4 | `Ascend910B4-1` | — | 约 61 GiB | — | PyTorch 2.6.0，PrivateUse1=`npu` |
+| NVIDIA | A100-SXM4-40GB | `NVIDIA A100-SXM4-40GB` / SM 8.0 | 108 SM | 约 40 GiB | 32 | PyTorch 2.9.0，CUDA 12.8 |
+| 平头哥 T-Head | PPU-ZW810E（真武 810E） | `PPU-ZW810E` | 64 CU | 约 96 GiB | 32 | PyTorch 2.9.0，CUDA ABI 12.9 |
+| 天数智芯 | Iluvatar BI-V150 | `Iluvatar BI-V150` / CC 7.1 | 16 CU | 32 GiB | 64 | PyTorch 2.7.1，CUDA ABI 10.2 |
+
 ## 最终官方榜单
 
 | 题目 | 最终排名 | 最终平均加速比 | 海光 | 沐曦 | 昇腾 | NVIDIA | 平头哥 | 天数智芯 |
