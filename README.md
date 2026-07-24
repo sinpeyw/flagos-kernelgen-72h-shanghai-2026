@@ -34,6 +34,7 @@
 ## 技术报告
 
 - [Task 01：融合访存、行分组与昇腾双 AIV 映射](reports/task01_fused_add_rmsnorm_group_quant.md)
+- [Task 01 获奖分享：融合算子优化（PDF）](reports/FlagOS_Kernel_Challenge_Task1获奖分享.pdf)
 - [Task 02：分层精确 TopK、结构化快路径与后端专用选择器](reports/task02_dsa_topk_page_table_transform.md)
 - [Task 03：共享 P/dS 生产、dK+dV 融合与受控归约](reports/task03_mla_bwd_nope_dkdv.md)
 
